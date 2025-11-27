@@ -4,11 +4,12 @@ const app = express();
 
 app.use(express.json());
 
-// Add a Health Check endpoint so Render knows we are alive
+// Health Check
 app.get('/', (req, res) => {
     res.send('Scanner is Ready');
 });
 
+// The Main Scan Route
 app.post('/scan', (req, res) => {
     const { repo } = req.body;
     
@@ -17,17 +18,21 @@ app.post('/scan', (req, res) => {
     console.log(`🚀 Scanning: ${repo}`);
 
     try {
-        // Run Trivy Scan
-        // We use --timeout 30m to handle large repos
-        const command = `trivy repo ${repo} --scanners license,vuln --format json --timeout 30m`;
+        // Run Trivy with --quiet flag to stop it from printing "Downloading..." text
+        // This ensures the output is pure JSON
+        const command = `trivy repo ${repo} --scanners license,vuln --format json --timeout 30m --quiet`;
+        
+        console.log('⏳ Running Trivy (This takes time)...');
+        
+        // Execute command
         const output = execSync(command, { encoding: 'utf-8', maxBuffer: 100 * 1024 * 1024 });
         
-        // Return the raw JSON to Make.com
+        // Parse and send back to Make.com
         res.json(JSON.parse(output));
+        console.log('✅ Scan Complete');
         
     } catch (error) {
-        console.error('Scan Error:', error.message);
-        // We still send the error back so Make.com knows it failed
+        console.error('❌ Scan Failed:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
