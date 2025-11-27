@@ -1,0 +1,5 @@
+{
+    "project": "MortgageApp",
+    "licenses": ["MIT", "AGPL-3.0"],
+    "vulnerabilities": 12
+  }
