@@ -141,15 +141,14 @@ async function runBackgroundScan(repo, token, scanId) {
 
         // Construct the PERFECT Public URL
         const pdfUrl = `${cleanSupabaseUrl}/storage/v1/object/public/audits/${fileName}`;
-        
         // G. UPDATE DATABASE
         await supabase
             .from('scans')
             .update({ 
                 status: status,
                 risk_grade: grade,
-                pdf_url: pdfUrl, // This link is now 100% correct
-                findings_json: scanResults,
+                pdf_url: pdfUrl,
+                // findings_json removed to prevent payload too large error
                 completed_at: new Date().toISOString()
             })
             .eq('id', scanId);
