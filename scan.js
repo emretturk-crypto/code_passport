@@ -4,6 +4,20 @@ const { createClient } = require('@supabase/supabase-js');
 const generateCertificate = require('./generateCertificate'); 
 
 const app = express();
+
+// ✅ NEW: ALLOW BROWSERS TO TALK TO US (CORS)
+app.use((req, res, next) => {
+    res.header("Access-Control-Allow-Origin", "*"); // Allow any website (Lovable)
+    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
+    res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS"); // Allow these actions
+    
+    // If browser asks "Can I post?", say YES immediately
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(200);
+    }
+    next();
+});
+
 app.use(express.json());
 
 const supabaseUrl = process.env.SUPABASE_URL;
