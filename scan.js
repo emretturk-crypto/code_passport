@@ -1,33 +1,33 @@
 const express = require('express');
 const { execSync } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
-// Import the PDF Generator
 const generateCertificate = require('./generateCertificate'); 
 
 const app = express();
-
 app.use(express.json());
 
-// --- CONFIGURATION ---
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 app.get('/', (req, res) => res.send('Harmonized Audit Engine Ready'));
 
-// --- LOOP 1: THE RECEPTIONIST ---
 app.post('/scan', async (req, res) => {
-    const { repo, token } = req.body;
+    // ✅ NEW: We now accept userId from the frontend
+    const { repo, token, userId } = req.body; 
+    
     if (!repo) return res.status(400).send('No repo provided');
+    // We don't block if userId is missing, but it's good to have
 
     console.log(`🚀 Request Received for: ${repo}`);
 
     try {
-        // 1. Create DB Record (Get ID)
+        // 1. Create DB Record
         const { data: scanRecord, error: dbError } = await supabase
             .from('scans')
             .insert([{ 
                 repo_url: repo, 
+                user_id: userId, // ✅ NEW: Links the scan to the user
                 status: 'RUNNING',
                 scanner_version: 'Trivy v0.48.3',
                 created_at: new Date().toISOString()
@@ -42,14 +42,12 @@ app.post('/scan', async (req, res) => {
 
         const scanId = scanRecord.id;
 
-        // 2. Reply Immediately
         res.json({
             message: "Scan Started Successfully",
             scan_id: scanId,
             status: "RUNNING"
         });
 
-        // 3. Trigger Background Work
         runBackgroundScan(repo, token, scanId);
 
     } catch (error) {
@@ -58,7 +56,6 @@ app.post('/scan', async (req, res) => {
     }
 });
 
-// --- LOOP 2: THE WORKER ---
 async function runBackgroundScan(repo, token, scanId) {
     console.log(`⚡ Background Scan Started for ID: ${scanId}`);
     let scanResults; 
@@ -67,23 +64,23 @@ async function runBackgroundScan(repo, token, scanId) {
     let pdfBuffer;
 
     try {
-        // A. AUTHENTICATION LOGIC
+        // ... (Scanning Logic remains the same) ...
+        // B. TRIVY SCAN
         let authRepo = repo;
         if (token && repo.includes('github.com')) {
-            const cleanUrl = repo.replace('https://', '');
-            authRepo = `https://${token}@${cleanUrl}`;
+           const cleanUrl = repo.replace('https://', '');
+           authRepo = `https://${token}@${cleanUrl}`;
         }
-
-        // B. TRIVY SCAN (Heavy Lifting)
+        
+        // Shortened for brevity (The logic you pasted was fine here)
         const command = `trivy repo ${authRepo} --scanners license,vuln --format json --timeout 30m --quiet`;
         const output = execSync(command, { encoding: 'utf-8', maxBuffer: 100 * 1024 * 1024 });
         scanResults = JSON.parse(output);
 
-        // C. ANALYZE RISKS
+        // ... (Analysis Logic remains the same) ...
         let viralLicenses = [];
         let criticalVulns = [];
-        let highVulnsCount = 0;
-
+        
         if (scanResults.Results) {
             scanResults.Results.forEach(target => {
                 if (target.Licenses) {
@@ -94,53 +91,48 @@ async function runBackgroundScan(repo, token, scanId) {
                     });
                 }
                 if (target.Vulnerabilities) {
-                    target.Vulnerabilities.forEach(vuln => {
+                     target.Vulnerabilities.forEach(vuln => {
                         if (vuln.Severity === 'CRITICAL') {
                             criticalVulns.push({ id: vuln.VulnerabilityID, pkg: vuln.PkgName, severity: 'CRITICAL' });
                         }
-                        if (vuln.Severity === 'HIGH') {
-                            highVulnsCount++;
-                        }
-                    });
+                     });
                 }
             });
         }
 
-        // D. GRADING LOGIC
         grade = 'A';
         if (viralLicenses.length > 0) grade = 'F';
         else if (criticalVulns.length > 0) grade = 'C';
         status = (grade === 'F') ? "FAILED" : "COMPLETED";
 
-        // E. NATIVE PDF GENERATION
+        // E. PDF GENERATION
         console.log(`🎨 Generating PDF Certificate...`);
-        
         const generationData = {
             grade: grade,
             viral_licenses: viralLicenses,
             critical_vulns: criticalVulns
         };
-        
         pdfBuffer = await generateCertificate(generationData, scanId, repo);
         
-        // F. UPLOAD TO SUPABASE (The Harmonized Fix)
-        const fileName = `${scanId}.pdf`;
-
-        // 🛑 FIX: Clean the Supabase URL to prevent double slashes
-        // If supabaseUrl ends with '/', remove it. Otherwise keep it.
+        // F. UPLOAD TO SUPABASE
+        // ✅ CORRECT: Using dynamic name based on ID
+        const fileName = `${scanId}.pdf`; 
+        
+        // Clean URL to avoid double slash
         const cleanSupabaseUrl = supabaseUrl.endsWith('/') ? supabaseUrl.slice(0, -1) : supabaseUrl;
 
-        const { data: uploadData, error: uploadError } = await supabase.storage
-            .from('audits') // Using your clean 'audits' bucket
+        const { error: uploadError } = await supabase.storage
+            .from('audits') // ✅ CORRECT: Using 'audits' bucket
             .upload(fileName, pdfBuffer, {
                 contentType: 'application/pdf',
-                upsert: true // Allows overwriting
+                upsert: true 
             });
 
         if (uploadError) throw new Error(`Supabase Upload Failed: ${uploadError.message}`);
 
-        // Construct the PERFECT Public URL
+        // ✅ CORRECT: Constructing URL for 'audits' bucket
         const pdfUrl = `${cleanSupabaseUrl}/storage/v1/object/public/audits/${fileName}`;
+
         // G. UPDATE DATABASE
         await supabase
             .from('scans')
@@ -148,7 +140,6 @@ async function runBackgroundScan(repo, token, scanId) {
                 status: status,
                 risk_grade: grade,
                 pdf_url: pdfUrl,
-                // findings_json removed to prevent payload too large error
                 completed_at: new Date().toISOString()
             })
             .eq('id', scanId);
