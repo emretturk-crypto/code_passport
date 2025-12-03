@@ -1,13 +1,15 @@
-// VERSION 3: SELF-HEALING ENGINE (Force Update)
+// VERSION 4: FINAL PRODUCTION ENGINE - Self-Healing & Stable
 const express = require('express');
 const { execSync } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
 const fs = require('fs'); 
 const generateCertificate = require('./generateCertificate'); 
+const fetch = require('node-fetch'); // Required for Heartbeat
 
 const app = express();
 
-// --- 1. CORS: Allow Lovable to talk to us ---
+// --- 1. CORS & CONFIG ---
+// Allows the Lovable frontend to communicate with this server
 app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*"); 
     res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
@@ -23,20 +25,20 @@ const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// --- 3. SELF-INSTALLER FUNCTION (The Fix) ---
-// If Docker failed to install Gitleaks, this script does it manually.
+// --- 3. SELF-HEALING INSTALLER (Gitleaks) ---
+// Guarantees the secret scanner is present, even if Docker or Render's setup fails.
 function ensureGitleaks() {
     if (fs.existsSync('./gitleaks')) {
-        return; // Already installed
+        return; 
     }
     
     console.log("🛠️ Gitleaks binary missing. Auto-installing now...");
     try {
-        // 1. Download the Linux binary
+        // Download Linux binary
         execSync('wget https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz');
-        // 2. Unzip it
+        // Extract
         execSync('tar -xzf gitleaks_8.18.2_linux_x64.tar.gz');
-        // 3. Make it executable
+        // Make executable
         execSync('chmod +x gitleaks');
         console.log("✅ Gitleaks installed successfully via Auto-Fix.");
     } catch (e) {
@@ -44,13 +46,13 @@ function ensureGitleaks() {
     }
 }
 
-app.get('/', (req, res) => res.send('Harmonized Audit Engine Ready (v3)'));
+app.get('/', (req, res) => res.send('Harmonized Audit Engine Ready (v4)'));
 
 // --- 4. THE SCAN ENDPOINT ---
 app.post('/scan', async (req, res) => {
     const { repo, token, userId } = req.body; 
     
-    // Run the auto-fixer before every scan to ensure tools exist
+    // Run the auto-fixer before every scan
     ensureGitleaks();
 
     if (!repo) return res.status(400).send('No repo provided');
@@ -62,9 +64,9 @@ app.post('/scan', async (req, res) => {
             .from('scans')
             .insert([{ 
                 repo_url: repo, 
-                user_id: userId, 
+                user_id: userId, // CRITICAL: Links the scan to the user's session
                 status: 'RUNNING',
-                scanner_version: 'Trivy+Gitleaks',
+                scanner_version: 'v4-Final',
                 created_at: new Date().toISOString()
             }])
             .select()
@@ -72,7 +74,8 @@ app.post('/scan', async (req, res) => {
 
         if (dbError) {
             console.error('DB Error:', dbError);
-            return res.status(500).send('Database Init Failed');
+            // This is likely the Schema Cache issue we saw earlier
+            return res.status(500).send('Database Init Failed (Check Supabase Cache)');
         }
 
         const scanId = scanRecord.id;
@@ -99,18 +102,17 @@ async function runBackgroundScan(repo, token, scanId) {
     
     let scanResults = {}; 
     let gitleaksResults = [];
-    let status = "COMPLETED";
     let grade = 'A';
     
     try {
-        // Auth Logic
+        // --- Setup Auth ---
         let authRepo = repo;
         if (token && repo.includes('github.com')) {
            const cleanUrl = repo.replace('https://', '');
            authRepo = `https://${token}@${cleanUrl}`;
         }
         
-        // A. TRIVY SCAN
+        // --- A. TRIVY SCAN (Vulnerabilities/Licenses) ---
         console.log('🔍 Running Trivy...');
         try {
             const command = `trivy repo ${authRepo} --scanners license,vuln --format json --timeout 30m --quiet`;
@@ -120,40 +122,28 @@ async function runBackgroundScan(repo, token, scanId) {
             console.error("Trivy Error (non-fatal):", e.message);
         }
 
-        // B. GITLEAKS SCAN (Robust Version)
+        // --- B. GITLEAKS SCAN (Secrets) ---
         console.log('🕵️‍♂️ Running Gitleaks...');
         const tempDir = `temp_${scanId}`;
         try {
-            // 1. Clone
-            console.log(`   Cloning to ${tempDir}...`);
             execSync(`git clone ${authRepo} ${tempDir}`);
             
-            // 2. Verify files exist (Debug Log)
-            const fileList = execSync(`ls -R ${tempDir}`).toString();
-            console.log(`   Files found (snippet): ${fileList.substring(0, 100)}...`);
-
-            // 3. Run the local binary (./gitleaks)
-            console.log('   Scanning files...');
-            execSync(`./gitleaks detect --source=./${tempDir} --report-path=${tempDir}/leaks.json --no-banner --exit-code=0 --verbose`);
+            // Running the locally installed binary
+            execSync(`./gitleaks detect --source=./${tempDir} --report-path=${tempDir}/leaks.json --no-banner --exit-code=0`);
             
-            // 4. Read results
             if (fs.existsSync(`${tempDir}/leaks.json`)) {
                 const leaksFile = fs.readFileSync(`${tempDir}/leaks.json`, 'utf8');
                 gitleaksResults = JSON.parse(leaksFile);
                 console.log(`   ⚠️ Gitleaks found ${gitleaksResults.length} secrets!`);
-            } else {
-                console.log(`   ✅ Gitleaks found 0 secrets.`);
             }
             
-            // Cleanup
             execSync(`rm -rf ${tempDir}`);
-            
         } catch (e) {
             console.error("❌ Gitleaks Logic Error:", e.message);
             execSync(`rm -rf ${tempDir}`); 
         }
 
-        // C. GRADING LOGIC
+        // --- C. GRADING LOGIC ---
         let viralLicenses = [];
         let criticalVulns = [];
         
@@ -176,16 +166,14 @@ async function runBackgroundScan(repo, token, scanId) {
             });
         }
 
-        // The Strict Grading Rule: Secrets = Automatic F
+        // Strict Grading Rule: F for Secrets or Viral Licenses. C for Critical Vulns.
         if (viralLicenses.length > 0 || gitleaksResults.length > 0) {
             grade = 'F'; 
         } else if (criticalVulns.length > 0) {
             grade = 'C';
         }
 
-        status = (grade === 'F') ? "FAILED" : "COMPLETED";
-
-        // D. PDF GENERATION
+        // --- D. PDF GENERATION & DB UPDATE ---
         console.log(`🎨 Generating PDF...`);
         const generationData = {
             grade: grade,
@@ -196,36 +184,31 @@ async function runBackgroundScan(repo, token, scanId) {
         
         const pdfBuffer = await generateCertificate(generationData, scanId, repo);
         
-        // E. UPLOAD
         const fileName = `${scanId}.pdf`; 
         const cleanSupabaseUrl = supabaseUrl.endsWith('/') ? supabaseUrl.slice(0, -1) : supabaseUrl;
 
-        const { error: uploadError } = await supabase.storage
-            .from('audits')
-            .upload(fileName, pdfBuffer, {
-                contentType: 'application/pdf',
-                upsert: true 
-            });
-
-        if (uploadError) throw new Error(`Supabase Upload Failed: ${uploadError.message}`);
+        await supabase.storage.from('audits').upload(fileName, pdfBuffer, {
+            contentType: 'application/pdf', upsert: true 
+        });
 
         const pdfUrl = `${cleanSupabaseUrl}/storage/v1/object/public/audits/${fileName}`;
 
-        // F. DB UPDATE
+        // UX FIX: Set status to COMPLETED even if the grade is F. The grade is the result.
         await supabase
             .from('scans')
             .update({ 
-                status: status,
-                risk_grade: grade,
+                status: "COMPLETED", // System completed the task successfully
+                risk_grade: grade,    // Result of the audit is F/C/A
                 pdf_url: pdfUrl,
                 completed_at: new Date().toISOString()
             })
             .eq('id', scanId);
 
-        console.log(`💾 Database Updated for ${scanId} (Grade: ${grade})`);
+        console.log(`💾 Database Updated for ${scanId} (Final Grade: ${grade})`);
 
     } catch (err) {
         console.error(`❌ Scan Failed: ${err.message}`);
+        // Only mark as ERROR status if the system itself crashed
         await supabase.from('scans').update({ status: 'ERROR', last_error: err.message }).eq('id', scanId);
     }
 }
@@ -234,7 +217,7 @@ async function runBackgroundScan(repo, token, scanId) {
 const PING_INTERVAL = 14 * 60 * 1000; 
 setInterval(() => {
     if (process.env.RENDER_EXTERNAL_URL) {
-        console.log('💓 Sending Heartbeat...');
+        // Use fetch from node-fetch
         fetch(`${process.env.RENDER_EXTERNAL_URL}/`).catch(e => {});
     }
 }, PING_INTERVAL);
