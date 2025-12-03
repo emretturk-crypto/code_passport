@@ -167,4 +167,23 @@ async function runBackgroundScan(repo, token, scanId) {
 }
 
 const PORT = process.env.PORT || 8080;
+// --- KEEPER: PREVENT COLD STARTS ---
+// Ping myself every 14 minutes to stay awake (Render sleeps after 15m)
+const PING_INTERVAL = 14 * 60 * 1000; 
+
+setInterval(() => {
+    // Only ping if we are in production
+    // You must set 'RENDER_EXTERNAL_URL' in your Render Dashboard Env Vars
+    if (process.env.RENDER_EXTERNAL_URL) {
+        console.log('💓 Sending Heartbeat to stay awake...');
+        fetch(`${process.env.RENDER_EXTERNAL_URL}/`)
+            .then(res => {
+                if(res.ok) console.log(`💓 Heartbeat Successful`);
+                else console.log(`💔 Heartbeat bounced: ${res.status}`);
+            })
+            .catch(err => console.error(`💔 Heartbeat Failed: ${err.message}`));
+    }
+}, PING_INTERVAL);
+
+// ... app.listen is below this
 app.listen(PORT, () => console.log(`Harmonized Audit Engine running on ${PORT}`));
