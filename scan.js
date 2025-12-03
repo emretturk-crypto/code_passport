@@ -1,4 +1,4 @@
-// Force Update v2 - Self Healing Engine
+// VERSION 3: SELF-HEALING ENGINE (Force Update)
 const express = require('express');
 const { execSync } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
@@ -44,7 +44,7 @@ function ensureGitleaks() {
     }
 }
 
-app.get('/', (req, res) => res.send('Harmonized Audit Engine Ready'));
+app.get('/', (req, res) => res.send('Harmonized Audit Engine Ready (v3)'));
 
 // --- 4. THE SCAN ENDPOINT ---
 app.post('/scan', async (req, res) => {
