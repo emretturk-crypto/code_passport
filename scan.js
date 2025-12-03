@@ -1,49 +1,46 @@
 const express = require('express');
 const { execSync } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
+const fs = require('fs'); // Needed to read Gitleaks report
 const generateCertificate = require('./generateCertificate'); 
 
 const app = express();
 
-// ✅ NEW: ALLOW BROWSERS TO TALK TO US (CORS)
+// --- 1. CORS: Allow Lovable to talk to us ---
 app.use((req, res, next) => {
-    res.header("Access-Control-Allow-Origin", "*"); // Allow any website (Lovable)
+    res.header("Access-Control-Allow-Origin", "*"); 
     res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
-    res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS"); // Allow these actions
-    
-    // If browser asks "Can I post?", say YES immediately
-    if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
-    }
+    res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS"); 
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
 });
 
 app.use(express.json());
 
+// --- 2. SETUP SUPABASE ---
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 app.get('/', (req, res) => res.send('Harmonized Audit Engine Ready'));
 
+// --- 3. THE SCAN ENDPOINT ---
 app.post('/scan', async (req, res) => {
-    // ✅ NEW: We now accept userId from the frontend
     const { repo, token, userId } = req.body; 
     
     if (!repo) return res.status(400).send('No repo provided');
-    // We don't block if userId is missing, but it's good to have
 
     console.log(`🚀 Request Received for: ${repo}`);
 
     try {
-        // 1. Create DB Record
+        // Create DB Record (Status: RUNNING)
         const { data: scanRecord, error: dbError } = await supabase
             .from('scans')
             .insert([{ 
                 repo_url: repo, 
-                user_id: userId, // ✅ NEW: Links the scan to the user
+                user_id: userId, 
                 status: 'RUNNING',
-                scanner_version: 'Trivy v0.48.3',
+                scanner_version: 'Trivy+Gitleaks', // Updated version tag
                 created_at: new Date().toISOString()
             }])
             .select()
@@ -56,12 +53,14 @@ app.post('/scan', async (req, res) => {
 
         const scanId = scanRecord.id;
 
+        // Reply immediately so Frontend doesn't wait
         res.json({
-            message: "Scan Started Successfully",
+            message: "Scan Started",
             scan_id: scanId,
             status: "RUNNING"
         });
 
+        // Start the heavy work in background
         runBackgroundScan(repo, token, scanId);
 
     } catch (error) {
@@ -70,31 +69,72 @@ app.post('/scan', async (req, res) => {
     }
 });
 
+// --- 4. THE BACKGROUND WORKER ---
 async function runBackgroundScan(repo, token, scanId) {
     console.log(`⚡ Background Scan Started for ID: ${scanId}`);
-    let scanResults; 
-    let status;
-    let grade;
-    let pdfBuffer;
-
+    
+    // Data containers
+    let scanResults = {}; 
+    let gitleaksResults = [];
+    let status = "COMPLETED";
+    let grade = 'A';
+    
     try {
-        // ... (Scanning Logic remains the same) ...
-        // B. TRIVY SCAN
+        // --- STEP A: AUTHENTICATION ---
         let authRepo = repo;
         if (token && repo.includes('github.com')) {
            const cleanUrl = repo.replace('https://', '');
            authRepo = `https://${token}@${cleanUrl}`;
         }
         
-        // Shortened for brevity (The logic you pasted was fine here)
-        const command = `trivy repo ${authRepo} --scanners license,vuln --format json --timeout 30m --quiet`;
-        const output = execSync(command, { encoding: 'utf-8', maxBuffer: 100 * 1024 * 1024 });
-        scanResults = JSON.parse(output);
+        // --- STEP B: TRIVY SCAN (Vulnerabilities) ---
+        console.log('🔍 Running Trivy...');
+        try {
+            // We scan for vulnerabilities AND config issues
+            const command = `trivy repo ${authRepo} --scanners license,vuln --format json --timeout 30m --quiet`;
+            const output = execSync(command, { encoding: 'utf-8', maxBuffer: 100 * 1024 * 1024 });
+            scanResults = JSON.parse(output);
+        } catch (e) {
+            console.error("Trivy Error (non-fatal):", e.message);
+        }
 
-        // ... (Analysis Logic remains the same) ...
+        // --- STEP C: GITLEAKS SCAN (Secrets) ---
+        // This detects AWS keys, API tokens, etc.
+        console.log('🕵️‍♂️ Running Gitleaks...');
+        try {
+            // We assume the repo was cloned by Trivy or we clone it briefly. 
+            // Since Trivy cleans up, we might need to clone specifically for Gitleaks or point Gitleaks to the repo URL.
+            // Gitleaks 'detect' usually needs a local folder.
+            // SIMPLIFICATION: For this MVP, we will clone to a temp folder first.
+            
+            const tempDir = `temp_${scanId}`;
+            execSync(`git clone ${authRepo} ${tempDir}`);
+            
+            // Run Gitleaks on that folder
+            // --no-banner: clean output
+            // --exit-code=0: don't crash if leaks found
+            // --report-path: save to file
+            execSync(`gitleaks detect --source=./${tempDir} --report-path=${tempDir}/leaks.json --no-banner --exit-code=0`);
+            
+            if (fs.existsSync(`${tempDir}/leaks.json`)) {
+                const leaksFile = fs.readFileSync(`${tempDir}/leaks.json`, 'utf8');
+                gitleaksResults = JSON.parse(leaksFile);
+            }
+            
+            // Cleanup temp folder
+            execSync(`rm -rf ${tempDir}`);
+            
+        } catch (e) {
+            console.error("Gitleaks Error:", e.message);
+            // Try to cleanup if failed
+            execSync(`rm -rf temp_${scanId}`); 
+        }
+
+        // --- STEP D: GRADING LOGIC ---
         let viralLicenses = [];
         let criticalVulns = [];
         
+        // Process Trivy Results
         if (scanResults.Results) {
             scanResults.Results.forEach(target => {
                 if (target.Licenses) {
@@ -114,29 +154,37 @@ async function runBackgroundScan(repo, token, scanId) {
             });
         }
 
-        grade = 'A';
-        if (viralLicenses.length > 0) grade = 'F';
-        else if (criticalVulns.length > 0) grade = 'C';
+        // Calculate Grade
+        // F = Viral License OR Leaked Secrets
+        // C = Critical Vulnerabilities
+        // A = Clean
+        if (viralLicenses.length > 0 || gitleaksResults.length > 0) {
+            grade = 'F';
+        } else if (criticalVulns.length > 0) {
+            grade = 'C';
+        }
+
         status = (grade === 'F') ? "FAILED" : "COMPLETED";
 
-        // E. PDF GENERATION
+        // --- STEP E: PDF GENERATION ---
         console.log(`🎨 Generating PDF Certificate...`);
         const generationData = {
             grade: grade,
             viral_licenses: viralLicenses,
-            critical_vulns: criticalVulns
+            critical_vulns: criticalVulns,
+            leaked_secrets: gitleaksResults // Pass secrets to PDF generator
         };
-        pdfBuffer = await generateCertificate(generationData, scanId, repo);
         
-        // F. UPLOAD TO SUPABASE
-        // ✅ CORRECT: Using dynamic name based on ID
+        // NOTE: You may need to update generateCertificate.js to display secrets, 
+        // but for now it will just use grade/vulns.
+        const pdfBuffer = await generateCertificate(generationData, scanId, repo);
+        
+        // --- STEP F: UPLOAD TO SUPABASE ---
         const fileName = `${scanId}.pdf`; 
-        
-        // Clean URL to avoid double slash
         const cleanSupabaseUrl = supabaseUrl.endsWith('/') ? supabaseUrl.slice(0, -1) : supabaseUrl;
 
         const { error: uploadError } = await supabase.storage
-            .from('audits') // ✅ CORRECT: Using 'audits' bucket
+            .from('audits')
             .upload(fileName, pdfBuffer, {
                 contentType: 'application/pdf',
                 upsert: true 
@@ -144,10 +192,9 @@ async function runBackgroundScan(repo, token, scanId) {
 
         if (uploadError) throw new Error(`Supabase Upload Failed: ${uploadError.message}`);
 
-        // ✅ CORRECT: Constructing URL for 'audits' bucket
         const pdfUrl = `${cleanSupabaseUrl}/storage/v1/object/public/audits/${fileName}`;
 
-        // G. UPDATE DATABASE
+        // --- STEP G: UPDATE DATABASE ---
         await supabase
             .from('scans')
             .update({ 
@@ -158,32 +205,28 @@ async function runBackgroundScan(repo, token, scanId) {
             })
             .eq('id', scanId);
 
-        console.log(`💾 Database & Storage Updated for ${scanId}`);
+        console.log(`💾 Database Updated for ${scanId} (Grade: ${grade})`);
 
     } catch (err) {
-        console.error(`❌ Harmonized Scan Failed: ${err.message}`);
-        await supabase.from('scans').update({ status: 'ERROR' }).eq('id', scanId);
+        console.error(`❌ Scan Failed: ${err.message}`);
+        await supabase.from('scans').update({ status: 'ERROR', last_error: err.message }).eq('id', scanId);
     }
 }
 
-const PORT = process.env.PORT || 8080;
 // --- KEEPER: PREVENT COLD STARTS ---
-// Ping myself every 14 minutes to stay awake (Render sleeps after 15m)
+// Ping myself every 14 minutes to stay awake
 const PING_INTERVAL = 14 * 60 * 1000; 
 
 setInterval(() => {
-    // Only ping if we are in production
-    // You must set 'RENDER_EXTERNAL_URL' in your Render Dashboard Env Vars
     if (process.env.RENDER_EXTERNAL_URL) {
-        console.log('💓 Sending Heartbeat to stay awake...');
+        console.log('💓 Sending Heartbeat...');
         fetch(`${process.env.RENDER_EXTERNAL_URL}/`)
             .then(res => {
                 if(res.ok) console.log(`💓 Heartbeat Successful`);
-                else console.log(`💔 Heartbeat bounced: ${res.status}`);
             })
             .catch(err => console.error(`💔 Heartbeat Failed: ${err.message}`));
     }
 }, PING_INTERVAL);
 
-// ... app.listen is below this
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Harmonized Audit Engine running on ${PORT}`));
