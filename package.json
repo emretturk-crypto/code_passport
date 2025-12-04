@@ -1,7 +1,16 @@
 {
+  "name": "code-passport-scanner",
+  "version": "1.0.0",
+  "description": "Compliance Engine",
+  "main": "scan.js",
+  "scripts": {
+    "start": "node scan.js"
+  },
   "dependencies": {
-    "@supabase/supabase-js": "^2.86.0",
-    "express": "^5.1.0",
-    "pdfkit": "^0.17.2"
+    "@supabase/supabase-js": "^2.39.0",
+    "express": "^5.0.0",
+    "pdfkit": "^0.15.0",
+    "graphile-worker": "^0.16.0",
+    "node-fetch": "^2.7.0"
   }
 }
