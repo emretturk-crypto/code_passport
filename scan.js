@@ -56,7 +56,7 @@ const taskList = {
             console.log('   🕵️‍♂️ Running Gitleaks...');
             const tempDir = `temp_${scanId}`;
             try {
-                execSync(`git clone ${authRepo} ${tempDir}`);
+                execSync(`git clone --depth 1 ${authRepo} ${tempDir}`);
                 execSync(`gitleaks detect --source=./${tempDir} --report-path=${tempDir}/leaks.json --no-banner --exit-code=0`);
                 
                 if (fs.existsSync(`${tempDir}/leaks.json`)) {
