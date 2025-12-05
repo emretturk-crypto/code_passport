@@ -1,11 +1,11 @@
-// VERSION 6: QUEUE-BASED ARCHITECTURE
+// VERSION 7: FINAL PRODUCTION (Queue + SBOM + Crash Proof)
 const express = require('express');
 const { execSync } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
 const fs = require('fs'); 
 const generateCertificate = require('./generateCertificate'); 
 const fetch = require('node-fetch'); 
-const { run, quickAddJob } = require("graphile-worker"); // The Queue Library
+const { run, quickAddJob } = require("graphile-worker"); 
 
 const app = express();
 
@@ -24,38 +24,64 @@ app.use(express.json());
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
-// The connection string you just saved in Render
 const connectionString = process.env.DATABASE_URL; 
 
-// --- 3. THE WORKER TASK (This runs in the background) ---
+// --- 3. THE WORKER TASK ---
 const taskList = {
     scan_repo: async (payload, helpers) => {
         const { repo, token, scanId, userId } = payload;
         console.log(`👷 WORKER: Processing Scan ID ${scanId}`);
 
-        // --- SCANNING LOGIC MOVED HERE ---
         let scanResults = {}; 
         let gitleaksResults = [];
         let grade = 'A';
+        let sbomUrl = null; // New variable for SBOM
         
         try {
+            // Helper to clean URL for storage links
+            const cleanSupabaseUrl = supabaseUrl.endsWith('/') ? supabaseUrl.slice(0, -1) : supabaseUrl;
+
             let authRepo = repo;
             if (token && repo.includes('github.com')) {
                const cleanUrl = repo.replace('https://', '');
                authRepo = `https://${token}@${cleanUrl}`;
             }
             
-            // A. TRIVY
-            console.log('   🔍 Running Trivy...');
+            // A. TRIVY (Security Scan)
+            console.log('   🔍 Running Trivy (Security)...');
             try {
                 const output = execSync(`trivy repo ${authRepo} --scanners license,vuln --format json --timeout 30m --quiet`, { encoding: 'utf-8', maxBuffer: 100 * 1024 * 1024 });
                 scanResults = JSON.parse(output);
             } catch (e) { console.log("   Trivy warning:", e.message); }
 
-            // B. GITLEAKS
+            // A2. SBOM GENERATION (NEW FEATURE)
+            console.log('   📦 Generating SBOM (Inventory)...');
+            const sbomPath = `sbom_${scanId}.json`;
+            try {
+                // Generate CycloneDX JSON
+                execSync(`trivy repo ${authRepo} --format cyclonedx --output ${sbomPath} --quiet`);
+                
+                if (fs.existsSync(sbomPath)) {
+                    const sbomBuffer = fs.readFileSync(sbomPath);
+                    // Upload to Supabase
+                    await supabase.storage
+                        .from('audits')
+                        .upload(sbomPath, sbomBuffer, { contentType: 'application/json', upsert: true });
+                        
+                    sbomUrl = `${cleanSupabaseUrl}/storage/v1/object/public/audits/${sbomPath}`;
+                    
+                    // Cleanup local file immediately
+                    fs.unlinkSync(sbomPath);
+                }
+            } catch (e) {
+                console.log("   ⚠️ SBOM Generation failed:", e.message);
+            }
+
+            // B. GITLEAKS (Secrets)
             console.log('   🕵️‍♂️ Running Gitleaks...');
             const tempDir = `temp_${scanId}`;
             try {
+                // CRITICAL FIX: Added --depth 1 to prevent crashes
                 execSync(`git clone --depth 1 ${authRepo} ${tempDir}`);
                 execSync(`gitleaks detect --source=./${tempDir} --report-path=${tempDir}/leaks.json --no-banner --exit-code=0`);
                 
@@ -94,23 +120,23 @@ const taskList = {
             if (viralLicenses.length > 0 || gitleaksResults.length > 0) grade = 'F';
             else if (criticalVulns.length > 0) grade = 'C';
 
-            // D. PDF & DB
+            // D. PDF GENERATION
             console.log("   🎨 Generating PDF...");
             const generationData = { grade, viral_licenses: viralLicenses, critical_vulns: criticalVulns, leaked_secrets: gitleaksResults };
             const pdfBuffer = await generateCertificate(generationData, scanId, repo);
             
             const fileName = `${scanId}.pdf`;
-            const cleanSupabaseUrl = supabaseUrl.endsWith('/') ? supabaseUrl.slice(0, -1) : supabaseUrl;
 
             await supabase.storage.from('audits').upload(fileName, pdfBuffer, { contentType: 'application/pdf', upsert: true });
             
             const pdfUrl = `${cleanSupabaseUrl}/storage/v1/object/public/audits/${fileName}`;
 
-            // Final Update: Mark as COMPLETED
+            // E. FINAL DB UPDATE (Includes SBOM URL now)
             await supabase.from('scans').update({ 
                 status: "COMPLETED", 
                 risk_grade: grade,    
                 pdf_url: pdfUrl,
+                sbom_url: sbomUrl, // <--- SAVING THE PASSPORT
                 completed_at: new Date().toISOString()
             }).eq('id', scanId);
 
@@ -119,7 +145,6 @@ const taskList = {
         } catch (err) {
             console.error(`   ❌ Worker Failed: ${err.message}`);
             await supabase.from('scans').update({ status: 'ERROR', last_error: err.message }).eq('id', scanId);
-            // Throwing error makes the Queue retry automatically later!
             throw err; 
         }
     }
@@ -132,16 +157,15 @@ async function startWorker() {
         return;
     }
     console.log("🚜 Starting Job Worker...");
-    // This function runs alongside the web server
     await run({
         connectionString,
-        concurrency: 2, // Safety Limit: Only 2 scans at once to prevent crashes
+        concurrency: 2, 
         pollInterval: 1000,
         taskList,
     });
 }
 
-// --- 5. API ENDPOINT (The Receptionist) ---
+// --- 5. API ENDPOINT ---
 app.post('/scan', async (req, res) => {
     const { repo, token, userId } = req.body; 
     
@@ -149,14 +173,13 @@ app.post('/scan', async (req, res) => {
     console.log(`🚀 Request Queued for: ${repo}`);
 
     try {
-        // 1. Create "QUEUED" Record
         const { data: scanRecord, error } = await supabase
             .from('scans')
             .insert([{ 
                 repo_url: repo, 
                 user_id: userId, 
-                status: 'QUEUED', // New Status!
-                scanner_version: 'v6-Queue',
+                status: 'QUEUED', 
+                scanner_version: 'v7-SBOM', // Updated Version Name
                 created_at: new Date().toISOString()
             }])
             .select()
@@ -164,8 +187,6 @@ app.post('/scan', async (req, res) => {
 
         if (error) return res.status(500).send('Database Error');
 
-        // 2. Add to Job Queue (Instant)
-        // This takes 10ms, instead of waiting for the scan
         if (connectionString) {
             await quickAddJob(
                 { connectionString }, 
@@ -188,7 +209,7 @@ setInterval(() => {
     if (process.env.RENDER_EXTERNAL_URL) fetch(`${process.env.RENDER_EXTERNAL_URL}/`).catch(()=>{});
 }, 14 * 60 * 1000);
 
-// Start Server AND Worker
+// Start Server
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
     console.log(`Receptionist running on ${PORT}`);
