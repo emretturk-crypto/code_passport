@@ -1,0 +1,2 @@
+/// <reference types="node" />
+export declare function tryStat(pathToStat: string): Promise<import("fs").Stats | null>;

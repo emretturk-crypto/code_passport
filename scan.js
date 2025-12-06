@@ -1,4 +1,19 @@
-// VERSION 7: FINAL PRODUCTION (Queue + SBOM + Crash Proof)
+// VERSION 8: PRODUCTION + SENTRY MONITORING
+const Sentry = require("@sentry/node");
+const { nodeProfilingIntegration } = require("@sentry/profiling-node");
+
+// 1. Initialize Sentry (The Black Box Recorder)
+Sentry.init({
+  dsn: "https://34b8ed55cbf2419c2fdabe9683ff8366@o4510486964928512.ingest.de.sentry.io/4510487797760080",
+  integrations: [
+    nodeProfilingIntegration(),
+  ],
+  // Performance Monitoring
+  tracesSampleRate: 1.0, 
+  // Set sampling rate for profiling - this is relative to tracesSampleRate
+  profilesSampleRate: 1.0,
+});
+
 const express = require('express');
 const { execSync } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
@@ -9,7 +24,10 @@ const { run, quickAddJob } = require("graphile-worker");
 
 const app = express();
 
-// --- 1. CORS ---
+// Sentry Request Handler must be the first middleware on the app
+app.use(Sentry.Handlers.requestHandler());
+
+// --- 2. CORS ---
 app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*"); 
     res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
@@ -20,13 +38,13 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-// --- 2. CONFIG ---
+// --- 3. CONFIG ---
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 const connectionString = process.env.DATABASE_URL; 
 
-// --- 3. THE WORKER TASK ---
+// --- 4. THE WORKER TASK ---
 const taskList = {
     scan_repo: async (payload, helpers) => {
         const { repo, token, scanId, userId } = payload;
@@ -35,12 +53,10 @@ const taskList = {
         let scanResults = {}; 
         let gitleaksResults = [];
         let grade = 'A';
-        let sbomUrl = null; // New variable for SBOM
+        let sbomUrl = null; 
         
         try {
-            // Helper to clean URL for storage links
             const cleanSupabaseUrl = supabaseUrl.endsWith('/') ? supabaseUrl.slice(0, -1) : supabaseUrl;
-
             let authRepo = repo;
             if (token && repo.includes('github.com')) {
                const cleanUrl = repo.replace('https://', '');
@@ -52,36 +68,34 @@ const taskList = {
             try {
                 const output = execSync(`trivy repo ${authRepo} --scanners license,vuln --format json --timeout 30m --quiet`, { encoding: 'utf-8', maxBuffer: 100 * 1024 * 1024 });
                 scanResults = JSON.parse(output);
-            } catch (e) { console.log("   Trivy warning:", e.message); }
+            } catch (e) { 
+                console.log("   Trivy warning:", e.message); 
+            }
 
-            // A2. SBOM GENERATION (NEW FEATURE)
+            // A2. SBOM GENERATION
             console.log('   📦 Generating SBOM (Inventory)...');
             const sbomPath = `sbom_${scanId}.json`;
             try {
-                // Generate CycloneDX JSON
                 execSync(`trivy repo ${authRepo} --format cyclonedx --output ${sbomPath} --quiet`);
                 
                 if (fs.existsSync(sbomPath)) {
                     const sbomBuffer = fs.readFileSync(sbomPath);
-                    // Upload to Supabase
                     await supabase.storage
                         .from('audits')
                         .upload(sbomPath, sbomBuffer, { contentType: 'application/json', upsert: true });
                         
                     sbomUrl = `${cleanSupabaseUrl}/storage/v1/object/public/audits/${sbomPath}`;
-                    
-                    // Cleanup local file immediately
                     fs.unlinkSync(sbomPath);
                 }
             } catch (e) {
                 console.log("   ⚠️ SBOM Generation failed:", e.message);
+                Sentry.captureException(e); // Report minor errors too
             }
 
             // B. GITLEAKS (Secrets)
             console.log('   🕵️‍♂️ Running Gitleaks...');
             const tempDir = `temp_${scanId}`;
             try {
-                // CRITICAL FIX: Added --depth 1 to prevent crashes
                 execSync(`git clone --depth 1 ${authRepo} ${tempDir}`);
                 execSync(`gitleaks detect --source=./${tempDir} --report-path=${tempDir}/leaks.json --no-banner --exit-code=0`);
                 
@@ -93,6 +107,7 @@ const taskList = {
                 execSync(`rm -rf ${tempDir}`);
             } catch (e) {
                 console.error("   Gitleaks Error:", e.message);
+                Sentry.captureException(e);
                 execSync(`rm -rf ${tempDir}`);
             }
 
@@ -131,12 +146,12 @@ const taskList = {
             
             const pdfUrl = `${cleanSupabaseUrl}/storage/v1/object/public/audits/${fileName}`;
 
-            // E. FINAL DB UPDATE (Includes SBOM URL now)
+            // E. FINAL DB UPDATE
             await supabase.from('scans').update({ 
                 status: "COMPLETED", 
                 risk_grade: grade,    
                 pdf_url: pdfUrl,
-                sbom_url: sbomUrl, // <--- SAVING THE PASSPORT
+                sbom_url: sbomUrl,
                 completed_at: new Date().toISOString()
             }).eq('id', scanId);
 
@@ -144,13 +159,16 @@ const taskList = {
 
         } catch (err) {
             console.error(`   ❌ Worker Failed: ${err.message}`);
+            // NOTIFY SENTRY OF THE CRASH
+            Sentry.captureException(err);
+            
             await supabase.from('scans').update({ status: 'ERROR', last_error: err.message }).eq('id', scanId);
             throw err; 
         }
     }
 };
 
-// --- 4. START QUEUE LISTENER ---
+// --- 5. START QUEUE LISTENER ---
 async function startWorker() {
     if (!connectionString) {
         console.error("❌ MISSING DATABASE_URL! Worker cannot start.");
@@ -165,7 +183,7 @@ async function startWorker() {
     });
 }
 
-// --- 5. API ENDPOINT ---
+// --- 6. API ENDPOINT ---
 app.post('/scan', async (req, res) => {
     const { repo, token, userId } = req.body; 
     
@@ -179,7 +197,7 @@ app.post('/scan', async (req, res) => {
                 repo_url: repo, 
                 user_id: userId, 
                 status: 'QUEUED', 
-                scanner_version: 'v7-SBOM', // Updated Version Name
+                scanner_version: 'v8-Sentry', // Version Bump
                 created_at: new Date().toISOString()
             }])
             .select()
@@ -195,14 +213,20 @@ app.post('/scan', async (req, res) => {
             );
             res.json({ message: "Scan Queued", scan_id: scanRecord.id, status: "QUEUED" });
         } else {
+            const err = new Error("Server missing DATABASE_URL");
+            Sentry.captureException(err);
             res.status(500).json({ error: "Server missing DATABASE_URL" });
         }
 
     } catch (error) {
         console.error('Init Failed:', error.message);
+        Sentry.captureException(error);
         res.status(500).json({ error: error.message });
     }
 });
+
+// Sentry Error Handler must be before any other error middleware and after all controllers
+app.use(Sentry.Handlers.errorHandler());
 
 // Heartbeat
 setInterval(() => {
@@ -213,5 +237,8 @@ setInterval(() => {
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
     console.log(`Receptionist running on ${PORT}`);
-    startWorker().catch(e => console.error("Worker failed to start:", e));
+    startWorker().catch(e => {
+        console.error("Worker failed to start:", e);
+        Sentry.captureException(e);
+    });
 });

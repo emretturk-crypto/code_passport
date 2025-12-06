@@ -1,0 +1,13 @@
+import { EnhancedWithPgClient, TaskList } from "./interfaces";
+import { CompiledSharedOptions } from "./lib";
+export interface SupportedTaskIdentifierByTaskId {
+    [id: number]: string;
+}
+interface TaskDetails {
+    supportedTaskIdentifierByTaskId: SupportedTaskIdentifierByTaskId;
+    taskIds: number[];
+}
+export declare function getTaskDetails(compiledSharedOptions: CompiledSharedOptions, withPgClient: EnhancedWithPgClient, tasks: TaskList): TaskDetails | Promise<TaskDetails>;
+export declare function getSupportedTaskIdentifierByTaskId(compiledSharedOptions: CompiledSharedOptions, withPgClient: EnhancedWithPgClient, tasks: TaskList): SupportedTaskIdentifierByTaskId | Promise<SupportedTaskIdentifierByTaskId>;
+export declare function getSupportedTaskIds(compiledSharedOptions: CompiledSharedOptions, withPgClient: EnhancedWithPgClient, tasks: TaskList): number[] | Promise<number[]>;
+export {};

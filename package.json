@@ -7,10 +7,12 @@
     "start": "node scan.js"
   },
   "dependencies": {
+    "@sentry/node": "^10.29.0",
+    "@sentry/profiling-node": "^10.29.0",
     "@supabase/supabase-js": "^2.39.0",
     "express": "^5.0.0",
-    "pdfkit": "^0.15.0",
     "graphile-worker": "^0.16.0",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "pdfkit": "^0.15.0"
   }
 }
