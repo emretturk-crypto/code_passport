@@ -73,11 +73,11 @@ function generateCertificate(scanData, scanId, repoUrl) {
             // Extract counts safely
             const viralCount = scanData.viral_licenses ? scanData.viral_licenses.length : 0;
             const vulnCount = scanData.critical_vulns ? scanData.critical_vulns.length : 0;
-            const secretCount = scanData.leaked_secrets ? scanData.leaked_secrets.length : 0; // NEW
+            const secretCount = scanData.leaked_secrets ? scanData.leaked_secrets.length : 0;
 
             doc.text(`• Viral Licenses Found: ${viralCount}`);
             doc.text(`• Critical Vulnerabilities: ${vulnCount}`);
-            doc.text(`• Hardcoded Secrets: ${secretCount}`); // NEW
+            doc.text(`• Hardcoded Secrets: ${secretCount}`); 
 
             doc.moveDown(2);
 
@@ -145,7 +145,7 @@ function generateCertificate(scanData, scanId, repoUrl) {
         } catch (error) {
             reject(error);
         }
-    });
-}
+    }); 
+} 
 
 module.exports = generateCertificate;
