@@ -7,8 +7,8 @@
     "start": "node scan.js"
   },
   "dependencies": {
-    "@sentry/node": "^10.29.0",
-    "@sentry/profiling-node": "^10.29.0",
+    "@sentry/node": "^7.120.4",
+    "@sentry/profiling-node": "^1.3.5",
     "@supabase/supabase-js": "^2.39.0",
     "express": "^5.0.0",
     "graphile-worker": "^0.16.0",
