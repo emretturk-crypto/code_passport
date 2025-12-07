@@ -1,17 +1,12 @@
-// VERSION 8: PRODUCTION + SENTRY MONITORING
+// VERSION 9: STABLE SENTRY V7
 const Sentry = require("@sentry/node");
-const { nodeProfilingIntegration } = require("@sentry/profiling-node");
+// Removed incompatible profiling import
 
-// 1. Initialize Sentry (The Black Box Recorder)
+// 1. Initialize Sentry (V7 Compatible)
 Sentry.init({
   dsn: "https://34b8ed55cbf2419c2fdabe9683ff8366@o4510486964928512.ingest.de.sentry.io/4510487797760080",
-  integrations: [
-    nodeProfilingIntegration(),
-  ],
-  // Performance Monitoring
+  // We removed the 'integrations' block that was causing the crash
   tracesSampleRate: 1.0, 
-  // Set sampling rate for profiling - this is relative to tracesSampleRate
-  profilesSampleRate: 1.0,
 });
 
 const express = require('express');
@@ -24,7 +19,7 @@ const { run, quickAddJob } = require("graphile-worker");
 
 const app = express();
 
-// Sentry Request Handler must be the first middleware on the app
+// Sentry Request Handler (V7 Compatible)
 app.use(Sentry.Handlers.requestHandler());
 
 // --- 2. CORS ---
@@ -89,7 +84,7 @@ const taskList = {
                 }
             } catch (e) {
                 console.log("   ⚠️ SBOM Generation failed:", e.message);
-                Sentry.captureException(e); // Report minor errors too
+                Sentry.captureException(e); 
             }
 
             // B. GITLEAKS (Secrets)
@@ -159,9 +154,7 @@ const taskList = {
 
         } catch (err) {
             console.error(`   ❌ Worker Failed: ${err.message}`);
-            // NOTIFY SENTRY OF THE CRASH
             Sentry.captureException(err);
-            
             await supabase.from('scans').update({ status: 'ERROR', last_error: err.message }).eq('id', scanId);
             throw err; 
         }
@@ -197,7 +190,7 @@ app.post('/scan', async (req, res) => {
                 repo_url: repo, 
                 user_id: userId, 
                 status: 'QUEUED', 
-                scanner_version: 'v8-Sentry', // Version Bump
+                scanner_version: 'v9-StableSentry', 
                 created_at: new Date().toISOString()
             }])
             .select()
@@ -225,7 +218,7 @@ app.post('/scan', async (req, res) => {
     }
 });
 
-// Sentry Error Handler must be before any other error middleware and after all controllers
+// Sentry Error Handler (V7 Compatible)
 app.use(Sentry.Handlers.errorHandler());
 
 // Heartbeat
