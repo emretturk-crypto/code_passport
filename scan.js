@@ -1,5 +1,6 @@
-// VERSION 12: ASYNC ENGINE + STREAMING TO FILE (SCALABLE)
+// VERSION 12.2: FINAL HARDENING (Rate Limit + Secure CORS + Sentry + Async Engine)
 const Sentry = require("@sentry/node");
+const rateLimit = require('express-rate-limit'); // <--- NEW SECURITY TOOL
 
 // 1. Initialize Sentry
 Sentry.init({
@@ -19,13 +20,40 @@ const { run, quickAddJob } = require("graphile-worker");
 const app = express();
 app.use(Sentry.Handlers.requestHandler());
 
+// --- 🛡️ SECURITY LAYER: CORS (The Bouncer) ---
+// Only allow specific trusted frontends to talk to us.
+const allowedOrigins = [
+    'http://localhost:8080',            // Local Backend Testing
+    'http://localhost:5173',            // Local React Frontend
+    'https://gpt-engineer.lovable.app', // Lovable Platform
+    'https://code-passport.onrender.com' // Your Production URL
+];
+
 app.use((req, res, next) => {
-    res.header("Access-Control-Allow-Origin", "*"); 
+    const origin = req.headers.origin;
+    if (allowedOrigins.includes(origin)) {
+        res.header("Access-Control-Allow-Origin", origin);
+    }
+    // Strict headers
     res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
     res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS"); 
+    
     if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
 });
+
+// --- 🚦 SECURITY LAYER: RATE LIMITING (The Traffic Light) ---
+// Limit each IP to 20 requests per 15 minutes.
+const limiter = rateLimit({
+	windowMs: 15 * 60 * 1000, // 15 minutes
+	limit: 20, // Limit each IP to 20 requests per windowMs
+    standardHeaders: true, 
+	legacyHeaders: false, 
+    message: { error: "Too many requests. Please try again in 15 minutes." }
+});
+
+// Apply rate limiter specifically to the scan endpoint
+app.use('/scan', limiter);
 
 app.use(express.json());
 
@@ -35,43 +63,65 @@ const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 const connectionString = process.env.DATABASE_URL; 
 
-// --- 🛡️ HELPER 1: SIMPLE COMMAND RUNNER (For small outputs) ---
-function runCommand(command, args, cwd = null) {
+// --- 🔒 HELPER: Sanitize Logs ---
+function sanitizeLog(str) {
+    if (!str) return '';
+    return str.replace(/:\/\/[^@]+@/g, '://***@');
+}
+
+// --- 🛡️ HELPER 1: SIMPLE COMMAND RUNNER ---
+function runCommand(command, args, cwd = null, timeoutMs = 1800000) { 
     return new Promise((resolve, reject) => {
         const proc = spawn(command, args, { cwd, shell: false });
         let stdout = '';
         let stderr = '';
+        
+        const timer = setTimeout(() => {
+            proc.kill();
+            reject(new Error(`Command timed out after ${timeoutMs}ms: ${command}`));
+        }, timeoutMs);
+
         proc.stdout.on('data', (data) => { stdout += data; });
         proc.stderr.on('data', (data) => { stderr += data; });
+
         proc.on('close', (code) => {
+            clearTimeout(timer);
             if (code === 0) resolve(stdout.trim());
-            else reject(new Error(`Command failed: ${command} ${args.join(' ')}\nStderr: ${stderr}`));
+            else {
+                const safeCommand = sanitizeLog(`${command} ${args.join(' ')}`);
+                const safeStderr = sanitizeLog(stderr);
+                reject(new Error(`Command failed: ${safeCommand}\nStderr: ${safeStderr}`));
+            }
         });
-        proc.on('error', (err) => reject(err));
+        proc.on('error', (err) => { clearTimeout(timer); reject(err); });
     });
 }
 
-// --- 🌊 HELPER 2: STREAMING COMMAND RUNNER (For Huge Files) ---
-// Writes output directly to a file. Never holds it in RAM.
-function runCommandToFile(command, args, filePath, cwd = null) {
+// --- 🌊 HELPER 2: STREAMING COMMAND RUNNER ---
+function runCommandToFile(command, args, filePath, cwd = null, timeoutMs = 1800000) {
     return new Promise((resolve, reject) => {
         const fileStream = fs.createWriteStream(filePath);
         const proc = spawn(command, args, { cwd, shell: false });
         
-        // Pipe stdout directly to the file
+        const timer = setTimeout(() => {
+            proc.kill();
+            reject(new Error(`Stream command timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+
         proc.stdout.pipe(fileStream);
 
         let stderr = '';
         proc.stderr.on('data', (data) => { stderr += data; });
 
         proc.on('close', (code) => {
-            if (code === 0) {
-                resolve(filePath);
-            } else {
-                reject(new Error(`Stream Command failed: ${command}\nStderr: ${stderr}`));
+            clearTimeout(timer);
+            if (code === 0) resolve(filePath);
+            else {
+                const safeStderr = sanitizeLog(stderr);
+                reject(new Error(`Stream Command failed: ${command}\nStderr: ${safeStderr}`));
             }
         });
-        proc.on('error', (err) => reject(err));
+        proc.on('error', (err) => { clearTimeout(timer); reject(err); });
     });
 }
 
@@ -87,7 +137,6 @@ const taskList = {
         let sbomUrl = null; 
         let currentHash = null;
         
-        // Create a unique temp folder for this job
         const jobDir = path.resolve(`temp_job_${scanId}`);
         if (!fs.existsSync(jobDir)) fs.mkdirSync(jobDir);
 
@@ -126,17 +175,15 @@ const taskList = {
                         last_error: "Cached Result",
                         completed_at: new Date().toISOString()
                     }).eq('id', scanId);
-                    // Cleanup
                     fs.rmSync(jobDir, { recursive: true, force: true });
                     return; 
                 }
             } catch (e) { console.log("   Cache warning:", e.message); }
             
-            // 2. TRIVY (Security) - STREAMED TO FILE
+            // 2. TRIVY (Security) - STREAMED
             console.log('   🔍 Running Trivy (Security)...');
             const trivyResultPath = path.join(jobDir, 'trivy_results.json');
             try {
-                // We use our new "runCommandToFile" to avoid RAM explosion
                 await runCommandToFile('trivy', [
                     'repo', authRepo, 
                     '--scanners', 'license,vuln', 
@@ -145,18 +192,16 @@ const taskList = {
                     '--quiet'
                 ], trivyResultPath);
 
-                // Read safely (Node handles file buffers better than captured stdout strings)
                 if (fs.existsSync(trivyResultPath)) {
                     const data = fs.readFileSync(trivyResultPath, 'utf8');
                     scanResults = JSON.parse(data);
                 }
             } catch (e) { console.log("   Trivy warning:", e.message); }
 
-            // 3. SBOM GENERATION - STREAMED
+            // 3. SBOM GENERATION
             console.log('   📦 Generating SBOM...');
             const sbomPath = path.join(jobDir, `sbom_${scanId}.json`);
             try {
-                // Trivy can write to file natively, but we ensure it works consistently
                 await runCommand('trivy', [
                     'repo', authRepo, 
                     '--format', 'cyclonedx', 
@@ -166,7 +211,7 @@ const taskList = {
                 
                 if (fs.existsSync(sbomPath)) {
                     const sbomBuffer = fs.readFileSync(sbomPath);
-                    const storagePath = `sbom_${scanId}.json`; // Storage filename
+                    const storagePath = `sbom_${scanId}.json`; 
                     await supabase.storage.from('audits').upload(storagePath, sbomBuffer, { contentType: 'application/json', upsert: true });
                     sbomUrl = `${cleanSupabaseUrl}/storage/v1/object/public/audits/${storagePath}`;
                 }
@@ -192,11 +237,9 @@ const taskList = {
                     gitleaksResults = JSON.parse(file);
                     console.log(`   ⚠️ Found ${gitleaksResults.length} secrets.`);
                 }
-            } catch (e) {
-                console.error("   Gitleaks Error:", e.message);
-            }
+            } catch (e) { console.error("   Gitleaks Error:", e.message); }
 
-            // 5. GRADING
+            // 5. GRADING & PDF
             let viralLicenses = [];
             let criticalVulns = [];
             if (scanResults.Results) {
@@ -218,7 +261,6 @@ const taskList = {
             if (viralLicenses.length > 0 || gitleaksResults.length > 0) grade = 'F';
             else if (criticalVulns.length > 0) grade = 'C';
 
-            // 6. PDF
             console.log("   🎨 Generating PDF...");
             const generationData = { grade, viral_licenses: viralLicenses, critical_vulns: criticalVulns, leaked_secrets: gitleaksResults };
             const pdfBuffer = await generateCertificate(generationData, scanId, repo);
@@ -226,7 +268,7 @@ const taskList = {
             await supabase.storage.from('audits').upload(fileName, pdfBuffer, { contentType: 'application/pdf', upsert: true });
             const pdfUrl = `${cleanSupabaseUrl}/storage/v1/object/public/audits/${fileName}`;
 
-            // 7. FINAL UPDATE
+            // 6. FINAL UPDATE
             await supabase.from('scans').update({ 
                 status: "COMPLETED", 
                 risk_grade: grade,    
@@ -244,12 +286,7 @@ const taskList = {
             await supabase.from('scans').update({ status: 'ERROR', last_error: err.message }).eq('id', scanId);
             throw err; 
         } finally {
-            // ALWAYS CLEAN UP DISK SPACE
-            try {
-                if (fs.existsSync(jobDir)) {
-                    fs.rmSync(jobDir, { recursive: true, force: true });
-                }
-            } catch(e) { console.error("Cleanup failed:", e.message); }
+            try { if (fs.existsSync(jobDir)) fs.rmSync(jobDir, { recursive: true, force: true }); } catch(e) {}
         }
     }
 };
@@ -263,11 +300,12 @@ async function startWorker() {
 app.post('/scan', async (req, res) => {
     const { repo, token, userId } = req.body; 
     if (!repo) return res.status(400).send('No repo provided');
+    // rate limiter handles the 429 error automatically if they spam
     console.log(`🚀 Request Queued for: ${repo}`);
     try {
         const { data: scanRecord, error } = await supabase
             .from('scans')
-            .insert([{ repo_url: repo, user_id: userId, status: 'QUEUED', scanner_version: 'v12-StreamEngine', created_at: new Date().toISOString() }])
+            .insert([{ repo_url: repo, user_id: userId, status: 'QUEUED', scanner_version: 'v12.2-Hardened', created_at: new Date().toISOString() }])
             .select().single();
         if (error) return res.status(500).send('Database Error');
         if (connectionString) {
