@@ -45,4 +45,4 @@ COPY --chown=node:node . .
 
 # 9. Start the Server
 EXPOSE 8080
-CMD ["node", "backend/scan.js"]
+CMD ["node", "scan.js"]
