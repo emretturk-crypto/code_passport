@@ -1,14 +1,14 @@
-// VERSION 10: PRODUCTION + SENTRY V7 + SMART CACHING
+// VERSION 11: ASYNC ENGINE + SECURITY HARDENING + SENTRY V7
 const Sentry = require("@sentry/node");
 
-// 1. Initialize Sentry (V7 Compatible)
+// 1. Initialize Sentry
 Sentry.init({
   dsn: "https://34b8ed55cbf2419c2fdabe9683ff8366@o4510486964928512.ingest.de.sentry.io/4510487797760080",
   tracesSampleRate: 1.0, 
 });
 
 const express = require('express');
-const { execSync } = require('child_process');
+const { spawn } = require('child_process'); // <--- CHANGED: Using spawn instead of execSync
 const { createClient } = require('@supabase/supabase-js');
 const fs = require('fs'); 
 const generateCertificate = require('./generateCertificate'); 
@@ -36,6 +36,35 @@ const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 const connectionString = process.env.DATABASE_URL; 
 
+// --- 🛡️ SECURE COMMAND RUNNER (The New Engine Heart) ---
+// 1. Returns a Promise (Non-blocking)
+// 2. Uses argument arrays (Prevents Command Injection)
+function runCommand(command, args, cwd = null) {
+    return new Promise((resolve, reject) => {
+        // shell: false is crucial. It means "don't use terminal", just run the file.
+        // This makes "rm -rf /" impossible to inject.
+        const proc = spawn(command, args, { cwd, shell: false });
+        
+        let stdout = '';
+        let stderr = '';
+
+        // Capture output efficiently
+        proc.stdout.on('data', (data) => { stdout += data; });
+        proc.stderr.on('data', (data) => { stderr += data; });
+
+        proc.on('close', (code) => {
+            if (code === 0) {
+                resolve(stdout.trim());
+            } else {
+                // Reject with the error output so we know what broke
+                reject(new Error(`Command failed: ${command} ${args.join(' ')}\nStderr: ${stderr}`));
+            }
+        });
+        
+        proc.on('error', (err) => reject(err));
+    });
+}
+
 // --- THE WORKER TASK ---
 const taskList = {
     scan_repo: async (payload, helpers) => {
@@ -51,7 +80,9 @@ const taskList = {
         try {
             const cleanSupabaseUrl = supabaseUrl.endsWith('/') ? supabaseUrl.slice(0, -1) : supabaseUrl;
             
-            // 1. Construct Auth URL
+            // 1. Construct Auth URL (Securely)
+            // Note: We will pass the token via environment vars or secure args in Phase 3.
+            // For now, we construct the URL but will run it safely.
             let authRepo = repo;
             if (token && repo.includes('github.com')) {
                const cleanUrl = repo.replace('https://', '');
@@ -59,18 +90,15 @@ const taskList = {
             }
 
             // ---------------------------------------------------------
-            // 🛑 CACHE CHECK (The New Efficiency Layer)
+            // 🛑 CACHE CHECK (Async Version)
             // ---------------------------------------------------------
             console.log('   🔎 Checking Commit Hash...');
             try {
-                // Get the latest commit hash without downloading the code (Fast!)
-                // This checks the live "Fingerprint" of the repo
-                const hashOutput = execSync(`git ls-remote ${authRepo} HEAD`).toString();
-                // Output looks like: "a1b2c3d4... HEAD"
+                // New: spawn('git', ['ls-remote', ...])
+                const hashOutput = await runCommand('git', ['ls-remote', authRepo, 'HEAD']);
                 currentHash = hashOutput.split('\t')[0];
                 console.log(`   🎯 Commit Hash: ${currentHash}`);
 
-                // Check DB for a COMPLETED scan with this EXACT hash
                 const { data: cachedScan } = await supabase
                     .from('scans')
                     .select('*')
@@ -82,31 +110,35 @@ const taskList = {
 
                 if (cachedScan) {
                     console.log(`   ⚡ CACHE HIT! Using results from Scan ${cachedScan.id}`);
-                    
-                    // Copy old results to the new scan row
                     await supabase.from('scans').update({ 
                         status: "COMPLETED", 
                         risk_grade: cachedScan.risk_grade,    
                         pdf_url: cachedScan.pdf_url,
                         sbom_url: cachedScan.sbom_url,
                         commit_hash: currentHash,
-                        last_error: "Cached Result", // Tagging it so we know
+                        last_error: "Cached Result",
                         completed_at: new Date().toISOString()
                     }).eq('id', scanId);
-                    
-                    return; // STOP HERE! We skip the heavy scan. 0 seconds wasted.
+                    return; 
                 }
             } catch (e) {
-                console.log("   ⚠️ Cache check failed (proceeding to full scan):", e.message);
-                // Don't crash if git ls-remote fails, just do a full scan
-                Sentry.captureException(e);
+                console.log("   ⚠️ Cache check warning:", e.message);
+                // Don't crash, just proceed
             }
             // ---------------------------------------------------------
             
             // A. TRIVY (Security Scan)
             console.log('   🔍 Running Trivy (Security)...');
             try {
-                const output = execSync(`trivy repo ${authRepo} --scanners license,vuln --format json --timeout 30m --quiet`, { encoding: 'utf-8', maxBuffer: 100 * 1024 * 1024 });
+                // Async + Array Args
+                const output = await runCommand('trivy', [
+                    'repo', 
+                    authRepo, 
+                    '--scanners', 'license,vuln', 
+                    '--format', 'json', 
+                    '--timeout', '30m', 
+                    '--quiet'
+                ]);
                 scanResults = JSON.parse(output);
             } catch (e) { console.log("   Trivy warning:", e.message); }
 
@@ -114,7 +146,14 @@ const taskList = {
             console.log('   📦 Generating SBOM...');
             const sbomPath = `sbom_${scanId}.json`;
             try {
-                execSync(`trivy repo ${authRepo} --format cyclonedx --output ${sbomPath} --quiet`);
+                await runCommand('trivy', [
+                    'repo', 
+                    authRepo, 
+                    '--format', 'cyclonedx', 
+                    '--output', sbomPath, 
+                    '--quiet'
+                ]);
+                
                 if (fs.existsSync(sbomPath)) {
                     const sbomBuffer = fs.readFileSync(sbomPath);
                     await supabase.storage.from('audits').upload(sbomPath, sbomBuffer, { contentType: 'application/json', upsert: true });
@@ -127,20 +166,32 @@ const taskList = {
             console.log('   🕵️‍♂️ Running Gitleaks...');
             const tempDir = `temp_${scanId}`;
             try {
-                execSync(`git clone --depth 1 ${authRepo} ${tempDir}`);
-                execSync(`gitleaks detect --source=./${tempDir} --report-path=${tempDir}/leaks.json --no-banner --exit-code=0`);
+                // 1. Clone securely
+                await runCommand('git', ['clone', '--depth', '1', authRepo, tempDir]);
+                
+                // 2. Detect Secrets
+                await runCommand('gitleaks', [
+                    'detect', 
+                    `--source=./${tempDir}`, 
+                    `--report-path=${tempDir}/leaks.json`, 
+                    '--no-banner', 
+                    '--exit-code=0'
+                ]);
+                
                 if (fs.existsSync(`${tempDir}/leaks.json`)) {
                     const file = fs.readFileSync(`${tempDir}/leaks.json`, 'utf8');
                     gitleaksResults = JSON.parse(file);
                     console.log(`   ⚠️ Found ${gitleaksResults.length} secrets.`);
                 }
-                execSync(`rm -rf ${tempDir}`);
+                // Cleanup
+                await runCommand('rm', ['-rf', tempDir]);
             } catch (e) {
                 console.error("   Gitleaks Error:", e.message);
-                execSync(`rm -rf ${tempDir}`);
+                // Ensure cleanup happens even on error
+                try { await runCommand('rm', ['-rf', tempDir]); } catch(err){} 
             }
 
-            // C. GRADING
+            // C. GRADING (Same Logic)
             let viralLicenses = [];
             let criticalVulns = [];
             if (scanResults.Results) {
@@ -170,13 +221,13 @@ const taskList = {
             await supabase.storage.from('audits').upload(fileName, pdfBuffer, { contentType: 'application/pdf', upsert: true });
             const pdfUrl = `${cleanSupabaseUrl}/storage/v1/object/public/audits/${fileName}`;
 
-            // E. FINAL UPDATE (With Hash)
+            // E. FINAL UPDATE
             await supabase.from('scans').update({ 
                 status: "COMPLETED", 
                 risk_grade: grade,    
                 pdf_url: pdfUrl,
                 sbom_url: sbomUrl,
-                commit_hash: currentHash, // <--- SAVING THE FINGERPRINT
+                commit_hash: currentHash,
                 completed_at: new Date().toISOString()
             }).eq('id', scanId);
 
@@ -208,11 +259,13 @@ app.post('/scan', async (req, res) => {
                 repo_url: repo, 
                 user_id: userId, 
                 status: 'QUEUED', 
-                scanner_version: 'v10-Caching', 
+                scanner_version: 'v11-AsyncEngine', 
                 created_at: new Date().toISOString() 
             }])
             .select().single();
+        
         if (error) return res.status(500).send('Database Error');
+        
         if (connectionString) {
             await quickAddJob({ connectionString }, "scan_repo", { repo, token, scanId: scanRecord.id, userId });
             res.json({ message: "Scan Queued", scan_id: scanRecord.id, status: "QUEUED" });
