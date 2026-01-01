@@ -1,4 +1,4 @@
-// VERSION 11: ASYNC ENGINE + SECURITY HARDENING + SENTRY V7
+// VERSION 12: ASYNC ENGINE + STREAMING TO FILE (SCALABLE)
 const Sentry = require("@sentry/node");
 
 // 1. Initialize Sentry
@@ -8,16 +8,15 @@ Sentry.init({
 });
 
 const express = require('express');
-const { spawn } = require('child_process'); // <--- CHANGED: Using spawn instead of execSync
+const { spawn } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
 const fs = require('fs'); 
+const path = require('path');
 const generateCertificate = require('./generateCertificate'); 
 const fetch = require('node-fetch'); 
 const { run, quickAddJob } = require("graphile-worker"); 
 
 const app = express();
-
-// Sentry Request Handler
 app.use(Sentry.Handlers.requestHandler());
 
 app.use((req, res, next) => {
@@ -36,31 +35,42 @@ const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 const connectionString = process.env.DATABASE_URL; 
 
-// --- 🛡️ SECURE COMMAND RUNNER (The New Engine Heart) ---
-// 1. Returns a Promise (Non-blocking)
-// 2. Uses argument arrays (Prevents Command Injection)
+// --- 🛡️ HELPER 1: SIMPLE COMMAND RUNNER (For small outputs) ---
 function runCommand(command, args, cwd = null) {
     return new Promise((resolve, reject) => {
-        // shell: false is crucial. It means "don't use terminal", just run the file.
-        // This makes "rm -rf /" impossible to inject.
         const proc = spawn(command, args, { cwd, shell: false });
-        
         let stdout = '';
         let stderr = '';
-
-        // Capture output efficiently
         proc.stdout.on('data', (data) => { stdout += data; });
+        proc.stderr.on('data', (data) => { stderr += data; });
+        proc.on('close', (code) => {
+            if (code === 0) resolve(stdout.trim());
+            else reject(new Error(`Command failed: ${command} ${args.join(' ')}\nStderr: ${stderr}`));
+        });
+        proc.on('error', (err) => reject(err));
+    });
+}
+
+// --- 🌊 HELPER 2: STREAMING COMMAND RUNNER (For Huge Files) ---
+// Writes output directly to a file. Never holds it in RAM.
+function runCommandToFile(command, args, filePath, cwd = null) {
+    return new Promise((resolve, reject) => {
+        const fileStream = fs.createWriteStream(filePath);
+        const proc = spawn(command, args, { cwd, shell: false });
+        
+        // Pipe stdout directly to the file
+        proc.stdout.pipe(fileStream);
+
+        let stderr = '';
         proc.stderr.on('data', (data) => { stderr += data; });
 
         proc.on('close', (code) => {
             if (code === 0) {
-                resolve(stdout.trim());
+                resolve(filePath);
             } else {
-                // Reject with the error output so we know what broke
-                reject(new Error(`Command failed: ${command} ${args.join(' ')}\nStderr: ${stderr}`));
+                reject(new Error(`Stream Command failed: ${command}\nStderr: ${stderr}`));
             }
         });
-        
         proc.on('error', (err) => reject(err));
     });
 }
@@ -77,24 +87,21 @@ const taskList = {
         let sbomUrl = null; 
         let currentHash = null;
         
+        // Create a unique temp folder for this job
+        const jobDir = path.resolve(`temp_job_${scanId}`);
+        if (!fs.existsSync(jobDir)) fs.mkdirSync(jobDir);
+
         try {
             const cleanSupabaseUrl = supabaseUrl.endsWith('/') ? supabaseUrl.slice(0, -1) : supabaseUrl;
             
-            // 1. Construct Auth URL (Securely)
-            // Note: We will pass the token via environment vars or secure args in Phase 3.
-            // For now, we construct the URL but will run it safely.
             let authRepo = repo;
             if (token && repo.includes('github.com')) {
                const cleanUrl = repo.replace('https://', '');
                authRepo = `https://${token}@${cleanUrl}`;
             }
 
-            // ---------------------------------------------------------
-            // 🛑 CACHE CHECK (Async Version)
-            // ---------------------------------------------------------
-            console.log('   🔎 Checking Commit Hash...');
+            // 1. CACHE CHECK
             try {
-                // New: spawn('git', ['ls-remote', ...])
                 const hashOutput = await runCommand('git', ['ls-remote', authRepo, 'HEAD']);
                 currentHash = hashOutput.split('\t')[0];
                 console.log(`   🎯 Commit Hash: ${currentHash}`);
@@ -109,7 +116,7 @@ const taskList = {
                     .maybeSingle();
 
                 if (cachedScan) {
-                    console.log(`   ⚡ CACHE HIT! Using results from Scan ${cachedScan.id}`);
+                    console.log(`   ⚡ CACHE HIT!`);
                     await supabase.from('scans').update({ 
                         status: "COMPLETED", 
                         risk_grade: cachedScan.risk_grade,    
@@ -119,36 +126,39 @@ const taskList = {
                         last_error: "Cached Result",
                         completed_at: new Date().toISOString()
                     }).eq('id', scanId);
+                    // Cleanup
+                    fs.rmSync(jobDir, { recursive: true, force: true });
                     return; 
                 }
-            } catch (e) {
-                console.log("   ⚠️ Cache check warning:", e.message);
-                // Don't crash, just proceed
-            }
-            // ---------------------------------------------------------
+            } catch (e) { console.log("   Cache warning:", e.message); }
             
-            // A. TRIVY (Security Scan)
+            // 2. TRIVY (Security) - STREAMED TO FILE
             console.log('   🔍 Running Trivy (Security)...');
+            const trivyResultPath = path.join(jobDir, 'trivy_results.json');
             try {
-                // Async + Array Args
-                const output = await runCommand('trivy', [
-                    'repo', 
-                    authRepo, 
+                // We use our new "runCommandToFile" to avoid RAM explosion
+                await runCommandToFile('trivy', [
+                    'repo', authRepo, 
                     '--scanners', 'license,vuln', 
                     '--format', 'json', 
                     '--timeout', '30m', 
                     '--quiet'
-                ]);
-                scanResults = JSON.parse(output);
+                ], trivyResultPath);
+
+                // Read safely (Node handles file buffers better than captured stdout strings)
+                if (fs.existsSync(trivyResultPath)) {
+                    const data = fs.readFileSync(trivyResultPath, 'utf8');
+                    scanResults = JSON.parse(data);
+                }
             } catch (e) { console.log("   Trivy warning:", e.message); }
 
-            // A2. SBOM GENERATION
+            // 3. SBOM GENERATION - STREAMED
             console.log('   📦 Generating SBOM...');
-            const sbomPath = `sbom_${scanId}.json`;
+            const sbomPath = path.join(jobDir, `sbom_${scanId}.json`);
             try {
+                // Trivy can write to file natively, but we ensure it works consistently
                 await runCommand('trivy', [
-                    'repo', 
-                    authRepo, 
+                    'repo', authRepo, 
                     '--format', 'cyclonedx', 
                     '--output', sbomPath, 
                     '--quiet'
@@ -156,42 +166,37 @@ const taskList = {
                 
                 if (fs.existsSync(sbomPath)) {
                     const sbomBuffer = fs.readFileSync(sbomPath);
-                    await supabase.storage.from('audits').upload(sbomPath, sbomBuffer, { contentType: 'application/json', upsert: true });
-                    sbomUrl = `${cleanSupabaseUrl}/storage/v1/object/public/audits/${sbomPath}`;
-                    fs.unlinkSync(sbomPath);
+                    const storagePath = `sbom_${scanId}.json`; // Storage filename
+                    await supabase.storage.from('audits').upload(storagePath, sbomBuffer, { contentType: 'application/json', upsert: true });
+                    sbomUrl = `${cleanSupabaseUrl}/storage/v1/object/public/audits/${storagePath}`;
                 }
-            } catch (e) { console.log("   ⚠️ SBOM failed:", e.message); }
+            } catch (e) { console.log("   SBOM failed:", e.message); }
 
-            // B. GITLEAKS (Secrets)
+            // 4. GITLEAKS - STREAMED CLONE & SCAN
             console.log('   🕵️‍♂️ Running Gitleaks...');
-            const tempDir = `temp_${scanId}`;
+            const repoDir = path.join(jobDir, 'repo_clone');
+            const leaksPath = path.join(jobDir, 'leaks.json');
+            
             try {
-                // 1. Clone securely
-                await runCommand('git', ['clone', '--depth', '1', authRepo, tempDir]);
-                
-                // 2. Detect Secrets
+                await runCommand('git', ['clone', '--depth', '1', authRepo, repoDir]);
                 await runCommand('gitleaks', [
                     'detect', 
-                    `--source=./${tempDir}`, 
-                    `--report-path=${tempDir}/leaks.json`, 
+                    `--source=${repoDir}`, 
+                    `--report-path=${leaksPath}`, 
                     '--no-banner', 
                     '--exit-code=0'
                 ]);
                 
-                if (fs.existsSync(`${tempDir}/leaks.json`)) {
-                    const file = fs.readFileSync(`${tempDir}/leaks.json`, 'utf8');
+                if (fs.existsSync(leaksPath)) {
+                    const file = fs.readFileSync(leaksPath, 'utf8');
                     gitleaksResults = JSON.parse(file);
                     console.log(`   ⚠️ Found ${gitleaksResults.length} secrets.`);
                 }
-                // Cleanup
-                await runCommand('rm', ['-rf', tempDir]);
             } catch (e) {
                 console.error("   Gitleaks Error:", e.message);
-                // Ensure cleanup happens even on error
-                try { await runCommand('rm', ['-rf', tempDir]); } catch(err){} 
             }
 
-            // C. GRADING (Same Logic)
+            // 5. GRADING
             let viralLicenses = [];
             let criticalVulns = [];
             if (scanResults.Results) {
@@ -213,7 +218,7 @@ const taskList = {
             if (viralLicenses.length > 0 || gitleaksResults.length > 0) grade = 'F';
             else if (criticalVulns.length > 0) grade = 'C';
 
-            // D. PDF GENERATION
+            // 6. PDF
             console.log("   🎨 Generating PDF...");
             const generationData = { grade, viral_licenses: viralLicenses, critical_vulns: criticalVulns, leaked_secrets: gitleaksResults };
             const pdfBuffer = await generateCertificate(generationData, scanId, repo);
@@ -221,7 +226,7 @@ const taskList = {
             await supabase.storage.from('audits').upload(fileName, pdfBuffer, { contentType: 'application/pdf', upsert: true });
             const pdfUrl = `${cleanSupabaseUrl}/storage/v1/object/public/audits/${fileName}`;
 
-            // E. FINAL UPDATE
+            // 7. FINAL UPDATE
             await supabase.from('scans').update({ 
                 status: "COMPLETED", 
                 risk_grade: grade,    
@@ -238,6 +243,13 @@ const taskList = {
             Sentry.captureException(err);
             await supabase.from('scans').update({ status: 'ERROR', last_error: err.message }).eq('id', scanId);
             throw err; 
+        } finally {
+            // ALWAYS CLEAN UP DISK SPACE
+            try {
+                if (fs.existsSync(jobDir)) {
+                    fs.rmSync(jobDir, { recursive: true, force: true });
+                }
+            } catch(e) { console.error("Cleanup failed:", e.message); }
         }
     }
 };
@@ -255,17 +267,9 @@ app.post('/scan', async (req, res) => {
     try {
         const { data: scanRecord, error } = await supabase
             .from('scans')
-            .insert([{ 
-                repo_url: repo, 
-                user_id: userId, 
-                status: 'QUEUED', 
-                scanner_version: 'v11-AsyncEngine', 
-                created_at: new Date().toISOString() 
-            }])
+            .insert([{ repo_url: repo, user_id: userId, status: 'QUEUED', scanner_version: 'v12-StreamEngine', created_at: new Date().toISOString() }])
             .select().single();
-        
         if (error) return res.status(500).send('Database Error');
-        
         if (connectionString) {
             await quickAddJob({ connectionString }, "scan_repo", { repo, token, scanId: scanRecord.id, userId });
             res.json({ message: "Scan Queued", scan_id: scanRecord.id, status: "QUEUED" });
